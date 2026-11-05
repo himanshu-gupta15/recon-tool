@@ -1,0 +1,7 @@
+node_modules
+.next
+.data
+server/uploads
+server/seed-files
+.env
+*.log
