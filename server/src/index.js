@@ -7,6 +7,9 @@ import { buildRouter } from './routes.js';
 const db = await connect();
 const app = express();
 app.disable('x-powered-by');
+// Hosted, requests arrive through the host's proxy and Next.js. Without this, the
+// login rate limit would count every visitor as one person.
+if (process.env.NODE_ENV === 'production') app.set('trust proxy', true);
 app.use(helmet());
 app.use(cookieParser());
 app.use(express.json({ limit: '1mb' }));

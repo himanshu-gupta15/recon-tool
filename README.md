@@ -26,6 +26,15 @@ Demo sign-ins all use the password `demo1234`:
 
 To see a partner's format change handled, upload `server/seed-files/try-me-courier-a-new-format.csv` as COD remittance for Courier Aggregator A.
 
+## Deploy
+
+`render.yaml` runs the web app and API as one free Render service. The database is a free MongoDB Atlas cluster.
+
+1. In Atlas, create a free M0 cluster and a database user. Under Network Access, allow `0.0.0.0/0`, because Render's free plan has no fixed address. Copy the connection string and put the user's password in it.
+2. In Render, choose New > Blueprint, connect this repo, and paste the connection string as `MONGODB_URI`.
+
+The first start loads the demo data, and later starts leave it alone. The free service sleeps after 15 idle minutes and takes about a minute to wake. This is a demo only: `ALLOW_DEMO_SEED` wipes any database that has no finished demo seed recorded in it, so never point it at real data.
+
 ## Commands
 
 | Command | What it does |

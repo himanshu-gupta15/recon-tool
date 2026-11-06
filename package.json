@@ -10,9 +10,11 @@
     "seed": "npm run seed -w server",
     "test": "npm test -w server",
     "perf": "npm run perf -w server",
-    "build": "npm run build -w web"
+    "build": "npm run build -w web",
+    "start": "concurrently -k -n api,web \"PORT=4000 npm start -w server\" \"npm start -w web\"",
+    "start:hosted": "npm run seed -w server && npm start"
   },
-  "devDependencies": {
+  "dependencies": {
     "concurrently": "^9.2.5"
   }
 }

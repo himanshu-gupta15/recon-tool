@@ -7,7 +7,9 @@ import { commitFile } from './ingest.js';
 import { runMatch } from './match.js';
 import { expectedPayment, expectedFreight, DAY, pctOf } from './engine.js';
 
-if (process.env.NODE_ENV === 'production') throw new Error('Demo seed is not for production');
+// A hosted demo opts in with ALLOW_DEMO_SEED. This wipes the database unless a finished seed is recorded in it.
+const PRODUCTION = process.env.NODE_ENV === 'production';
+if (PRODUCTION && !process.env.ALLOW_DEMO_SEED) throw new Error('Demo seed is not for production');
 const DIR = path.resolve('seed-files');
 const PASSWORD = process.env.DEMO_PASSWORD || 'demo1234';
 let s = 42;
@@ -106,9 +108,14 @@ const write = (name, rows) => {
   return p;
 };
 
+const db = await connect();
+if (PRODUCTION && await db.collection('meta').findOne({ _id: 'demoSeed' })) {
+  console.log('Demo data already loaded, leaving it as it is');
+  await close();
+  process.exit(0);
+}
 fs.rmSync(DIR, { recursive: true, force: true });
 fs.mkdirSync(DIR, { recursive: true });
-const db = await connect();
 for (const c of ['orders', 'lines', 'claims', 'cards', 'users', 'mappings', 'uploads', 'jobs', 'meta', 'audit']) await db.collection(c).deleteMany({});
 
 const hash = await bcrypt.hash(PASSWORD, 10);
@@ -168,5 +175,6 @@ write('try-me-courier-a-new-format.csv', [
 ]);
 
 const summary = await runMatch(db);
+await db.collection('meta').insertOne({ _id: 'demoSeed', at: new Date() });
 console.log('Injected:', tally, '\nMatch run:', summary, '\nSign in with finance@demo.local, returns@demo.local or founder@demo.local');
 await close();

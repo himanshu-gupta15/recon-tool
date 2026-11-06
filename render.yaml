@@ -1,0 +1,22 @@
+# One free web service runs the web app and the API. The database is MongoDB Atlas.
+services:
+  - type: web
+    name: recon-tool
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start:hosted
+    healthCheckPath: /login
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: MONGOMS_DISABLE_POSTINSTALL
+        value: "1"
+      - key: ALLOW_DEMO_SEED
+        value: "1"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGODB_URI
+        sync: false
