@@ -43,12 +43,37 @@ export function buildRouter(db) {
     next();
   };
 
-  r.post('/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false, validate: { trustProxy: false } }), async (req, res) => {
-    const user = await db.collection('users').findOne({ email: str(req.body?.email).toLowerCase() });
-    if (!user || !(await bcrypt.compare(str(req.body?.password), user.passwordHash))) throw fail(401, 'Wrong email or password');
+  const startSession = (res, user) => {
     const token = jwt.sign({ email: user.email, name: user.name, role: user.role }, SECRET, { expiresIn: '10h' });
     res.cookie('session', token, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 10 * 3600 * 1000 });
     res.json({ email: user.email, name: user.name, role: user.role });
+  };
+
+  r.post('/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false, validate: { trustProxy: false } }), async (req, res) => {
+    const user = await db.collection('users').findOne({ email: str(req.body?.email).toLowerCase() });
+    if (!user || !(await bcrypt.compare(str(req.body?.password), user.passwordHash))) throw fail(401, 'Wrong email or password');
+    startSession(res, user);
+  });
+
+  // Self-registration always gives the finance role, whatever the request says.
+  // Write-offs and customer details stay with the co-founder.
+  r.post('/auth/register', rateLimit({ windowMs: 60 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false, validate: { trustProxy: false } }), async (req, res) => {
+    const name = str(req.body?.name).trim();
+    const email = str(req.body?.email).trim().toLowerCase();
+    const password = str(req.body?.password);
+    if (!name || name.length > 80) throw fail(400, 'Enter your name, up to 80 characters');
+    if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw fail(400, 'Enter a valid email address');
+    if (password.length < 8 || Buffer.byteLength(password) > 72) throw fail(400, 'Use a password of 8 to 72 characters');
+    const user = { email, name, role: 'finance', passwordHash: await bcrypt.hash(password, 10), createdAt: new Date() };
+    try {
+      await db.collection('users').insertOne(user);
+    } catch (err) {
+      if (err.code === 11000) throw fail(409, 'An account with this email already exists');
+      throw err;
+    }
+    await audit({ user }, 'account.created', email);
+    res.status(201);
+    startSession(res, user);
   });
   r.post('/auth/logout', (req, res) => { res.clearCookie('session'); res.json({ ok: true }); });
   r.get('/me', auth(), (req, res) => res.json(req.user));

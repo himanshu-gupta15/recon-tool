@@ -1,4 +1,4 @@
-import { Ban, CheckCircle2, Download, FileCheck2, FileUp, FileX2, Link2, PenLine, Send, XCircle } from 'lucide-react';
+import { Ban, CheckCircle2, Download, FileCheck2, FileUp, FileX2, Link2, PenLine, Send, UserPlus, XCircle } from 'lucide-react';
 import { inr } from './format';
 import { SOURCE_LABEL, STATUS } from './status';
 
@@ -18,6 +18,7 @@ export function describeAudit(a) {
     case 'review.approve': return { icon: Link2, tone: 'success', text: <>linked a partner line to <b className="mono">{d.orderId}</b></>, object: d.orderId, kind: 'review', href: d.orderId ? `/orders/${encodeURIComponent(d.orderId)}` : undefined };
     case 'review.reject': return { icon: XCircle, tone: 'neutral', text: <>marked a partner line as not ours</>, object: `Line ${String(a.target).slice(-6)}`, kind: 'review' };
     case 'card.save': return { icon: PenLine, tone: 'info', text: <>saved a rate card for <b>{a.target}</b></>, object: d.effectiveFrom ? `Effective ${new Date(d.effectiveFrom).toISOString().slice(0, 10)}` : a.target, kind: 'card' };
+    case 'account.created': return { icon: UserPlus, tone: 'neutral', text: <>created an account</>, object: a.target, kind: 'other' };
     default: return { icon: PenLine, tone: 'neutral', text: <>{a.action}</>, object: a.target, kind: 'other' };
   }
 }

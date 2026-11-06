@@ -24,6 +24,8 @@ Demo sign-ins all use the password `demo1234`:
 | `founder@demo.local` | Finance co-founder | Everything, including write-offs and viewing customer details |
 | `returns@demo.local` | Returns manager | Returns, return claims and warehouse scan uploads |
 
+Anyone can also create an account at `/register`. New accounts always get the finance role and share the demo data, and there is no email verification.
+
 To see a partner's format change handled, upload `server/seed-files/try-me-courier-a-new-format.csv` as COD remittance for Courier Aggregator A.
 
 ## Deploy
