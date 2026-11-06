@@ -43,7 +43,7 @@ export function buildRouter(db) {
     next();
   };
 
-  r.post('/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false }), async (req, res) => {
+  r.post('/auth/login', rateLimit({ windowMs: 15 * 60 * 1000, limit: 20, standardHeaders: true, legacyHeaders: false, validate: { trustProxy: false } }), async (req, res) => {
     const user = await db.collection('users').findOne({ email: str(req.body?.email).toLowerCase() });
     if (!user || !(await bcrypt.compare(str(req.body?.password), user.passwordHash))) throw fail(401, 'Wrong email or password');
     const token = jwt.sign({ email: user.email, name: user.name, role: user.role }, SECRET, { expiresIn: '10h' });
@@ -171,15 +171,23 @@ export function buildRouter(db) {
     customerPhone: role === 'cofounder' ? o.customerPhone : maskPhone(o.customerPhone),
   });
 
+  // status may be one value or a comma-separated list; sort is optional and whitelisted.
+  const ORDER_SORTS = { orderDate: 'orderDate', value: 'value', expected: 'expected', received: 'received', gap: 'gap', orderId: 'orderId', freightExpected: 'freightExpected', freightCharged: 'freightCharged' };
   r.get('/orders', auth(FINANCE), async (req, res) => {
     const q = {};
     const status = str(req.query.status); const channel = str(req.query.channel); const search = str(req.query.q).trim();
-    if (status) q.status = status;
+    if (status) { const list = status.split(',').filter(Boolean); q.status = list.length > 1 ? { $in: list } : list[0]; }
     if (channel) q.channel = channel;
-    if (search) q.$or = [{ orderId: search }, { awb: search }];
-    const page = Math.max(1, Number(req.query.page) || 1); const size = 50;
+    if (str(req.query.issue)) q['issues.type'] = str(req.query.issue);
+    if (str(req.query.freight) === 'billed') q.freightCharged = { $gt: 0 };
+    if (search) q.$or = [{ orderId: search }, { awb: search }, { orderId: { $regex: `^${search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` } }];
+    const days = Number(req.query.days);
+    if (Number.isFinite(days) && days > 0) q.orderDate = { $gte: new Date(Date.now() - days * DAY) };
+    const sortKey = ORDER_SORTS[str(req.query.sort)]; const dir = str(req.query.dir) === 'asc' ? 1 : -1;
+    const sort = sortKey ? { [sortKey]: dir, orderId: 1 } : { orderDate: -1, orderId: 1 };
+    const page = Math.max(1, Number(req.query.page) || 1); const size = Math.min(100, Math.max(10, Number(req.query.size) || 50));
     const [rows, total, channels] = await Promise.all([
-      db.collection('orders').find(q, { projection: { issues: 0, customerName: 0, customerPhone: 0 } }).sort({ orderDate: -1, orderId: 1 }).skip((page - 1) * size).limit(size).toArray(),
+      db.collection('orders').find(q, { projection: { issues: 0, customerName: 0, customerPhone: 0 } }).sort(sort).skip((page - 1) * size).limit(size).toArray(),
       db.collection('orders').countDocuments(q),
       db.collection('orders').distinct('channel'),
     ]);
@@ -202,9 +210,22 @@ export function buildRouter(db) {
     else if (status !== 'all') q.status = status;
     if (str(req.query.partner)) q.partner = str(req.query.partner);
     if (str(req.query.type)) q.type = str(req.query.type);
+    const min = Number(req.query.min);
+    if (Number.isFinite(min) && min > 0) q.amount = { $gte: Math.round(min * 100) };
+    const since = new Date(str(req.query.since) + 'T00:00:00Z');
+    if (str(req.query.since) && !Number.isNaN(since.getTime())) q.ageFrom = { $gte: since };
+    const search = str(req.query.q).trim();
+    if (search) q.orderId = { $regex: `^${search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` };
     if (req.user.role === 'returns') q.type = 'return_not_received';
     return q;
   };
+
+  // Counts and amounts per claim status, for the claims summary cards.
+  r.get('/claims/summary', auth(), async (req, res) => {
+    const match = req.user.role === 'returns' ? { type: 'return_not_received' } : str(req.query.type) ? { type: str(req.query.type) } : {};
+    const rows = await db.collection('claims').aggregate([{ $match: match }, { $group: { _id: '$status', count: { $sum: 1 }, amount: { $sum: '$amount' }, recovered: { $sum: '$recovered' } } }]).toArray();
+    res.json(Object.fromEntries(rows.map((x) => [x._id, { count: x.count, amount: x.amount, recovered: x.recovered }])));
+  });
 
   r.get('/claims', auth(), async (req, res) => {
     const q = claimFilter(req);
@@ -339,6 +360,143 @@ export function buildRouter(db) {
       { $sort: { '_id.month': -1, '_id.partner': 1 } },
     ]).toArray();
     res.json(rows.map((x) => ({ partner: x._id.partner, month: x._id.month, net: x.net, tcs: x.tcs, tds: x.tds, lines: x.lines })));
+  });
+
+  // ---------- Overview: read-only roll-up of stored results for a date range ----------
+  // Reads the status, expected and received values the matcher already stored.
+  // Nothing is recalculated here.
+  const EXCEPTION = ['short_paid', 'unpaid_past_due', 'freight_overcharged', 'return_not_received', 'overpaid', 'missing_rate_card'];
+  r.get('/overview', auth(), async (req, res) => {
+    const now = Date.now();
+    const asDate = (s) => { const d = new Date(str(s) + 'T00:00:00Z'); return Number.isNaN(d.getTime()) ? null : d; };
+    const customFrom = asDate(req.query.from); const customTo = asDate(req.query.to);
+    let days = Number(req.query.days);
+    let end = new Date(now); let start = null;
+    if (customFrom) {
+      end = customTo ? new Date(customTo.getTime() + DAY) : new Date(now);
+      if (end <= customFrom) throw fail(400, 'The end date must be after the start date');
+      start = customFrom; days = Math.round((end - start) / DAY);
+    } else if (Number.isFinite(days) && days > 0) start = new Date(now - days * DAY);
+    const ranged = !!start;
+    const channel = str(req.query.channel);
+    const prevStart = ranged ? new Date(start.getTime() - (end - start)) : null;
+    const q = {};
+    if (ranged) q.orderDate = { $gte: prevStart, $lt: end };
+    if (channel) q.channel = channel;
+    const orders = await db.collection('orders').find(q, { projection: { _id: 0, orderId: 1, orderDate: 1, status: 1, channel: 1, expected: 1, received: 1, gap: 1, value: 1 } }).toArray();
+
+    const blank = () => ({ orders: 0, eligible: 0, settled: 0, exceptions: 0, reconciled: 0, expected: 0, received: 0, gap: 0, statuses: {} });
+    const cur = blank(); const prev = blank(); const byChannel = new Map(); const inRange = new Set();
+    let first = null;
+    for (const o of orders) {
+      const t = o.orderDate ? new Date(o.orderDate).getTime() : 0;
+      const isCur = !ranged || (t >= start.getTime() && t < end.getTime());
+      const s = isCur ? cur : prev;
+      if (isCur) { inRange.add(o.orderId); if (t && (!first || t < first)) first = t; }
+      s.orders++;
+      const st = s.statuses[o.status] ?? (s.statuses[o.status] = { count: 0, amount: 0 });
+      st.count++;
+      if (o.gap) st.amount += Math.abs(o.gap);
+      if (!['pending', 'cancelled'].includes(o.status)) s.eligible++;
+      if (o.status === 'settled') { s.settled++; s.reconciled += o.received ?? 0; }
+      if (EXCEPTION.includes(o.status)) s.exceptions++;
+      if (o.expected !== null && o.expected !== undefined) s.expected += o.expected;
+      s.received += o.received ?? 0;
+      if (o.gap < 0) s.gap += o.gap;
+      if (isCur) {
+        const c = byChannel.get(o.channel) ?? { channel: o.channel, orders: 0, eligible: 0, settled: 0, exceptions: 0, expected: 0, received: 0, shortfall: 0 };
+        c.orders++;
+        if (!['pending', 'cancelled'].includes(o.status)) c.eligible++;
+        if (o.status === 'settled') c.settled++;
+        if (EXCEPTION.includes(o.status)) c.exceptions++;
+        c.expected += o.expected ?? 0; c.received += o.received ?? 0;
+        if (o.gap < 0) c.shortfall += o.gap;
+        byChannel.set(o.channel, c);
+      }
+    }
+
+    // Trend buckets: days for a week, weeks up to a quarter, months beyond.
+    const spanDays = ranged ? days : Math.max(1, Math.ceil((now - (first ?? now)) / DAY));
+    const unit = spanDays <= 14 ? 'day' : spanDays <= 120 ? 'week' : 'month';
+    const bucketOf = (t) => {
+      const d = new Date(t);
+      if (unit === 'day') return d.toISOString().slice(0, 10);
+      if (unit === 'week') { const m = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - ((d.getUTCDay() + 6) % 7))); return m.toISOString().slice(0, 10); }
+      return d.toISOString().slice(0, 7);
+    };
+    const trend = new Map();
+    for (const o of orders) {
+      if (!o.orderDate || !inRange.has(o.orderId)) continue;
+      const k = bucketOf(new Date(o.orderDate).getTime());
+      const b = trend.get(k) ?? { bucket: k, total: 0 };
+      b[o.status] = (b[o.status] ?? 0) + 1; b.total++;
+      trend.set(k, b);
+    }
+
+    // Claims: open ones are a live snapshot; recoveries are dated by when they were recorded.
+    const claimMatch = req.user.role === 'returns' ? { type: 'return_not_received' } : {};
+    const active = await db.collection('claims').find({ ...claimMatch, status: { $in: ['open', 'filed'] } }, { projection: { orderId: 1, partner: 1, type: 1, amount: 1, ageFrom: 1, status: 1, detail: 1 } }).sort({ amount: -1 }).toArray();
+    const recoveredIn = async (from, to) => {
+      const m = { ...claimMatch, status: 'recovered' };
+      if (from) m.updatedAt = { $gte: from, ...(to ? { $lt: to } : {}) };
+      const [x] = await db.collection('claims').aggregate([{ $match: m }, { $group: { _id: null, amount: { $sum: '$recovered' }, count: { $sum: 1 } } }]).toArray();
+      return { amount: x?.amount ?? 0, count: x?.count ?? 0 };
+    };
+    const recovered = await recoveredIn(start, customFrom ? end : null);
+    const recoveredPrev = ranged ? await recoveredIn(prevStart, start) : null;
+
+    const scoped = active.filter((c) => (!ranged && !channel) || inRange.has(c.orderId));
+    const top = scoped.slice(0, 8);
+    const topOrders = new Map((await db.collection('orders').find({ orderId: { $in: top.map((c) => c.orderId) } }, { projection: { _id: 0, orderId: 1, orderDate: 1, channel: 1, expected: 1, received: 1, gap: 1, freightExpected: 1, freightCharged: 1, value: 1 } }).toArray()).map((o) => [o.orderId, o]));
+    const exceptions = top.map((c) => ({ ...c, order: topOrders.get(c.orderId) ?? null }));
+
+    const last = await db.collection('meta').findOne({ _id: 'lastRun' });
+    const review = await db.collection('lines').countDocuments({ state: 'review' });
+    res.json({
+      range: { days: ranged ? days : null, from: start, to: end, prevFrom: prevStart, unit, channel: channel || null },
+      target: RECOVERY_TARGET,
+      current: cur, previous: ranged ? prev : null,
+      openClaims: { count: scoped.length, amount: scoped.reduce((t, c) => t + c.amount, 0), toFile: scoped.filter((c) => c.status === 'open').length },
+      recovered, recoveredPrev,
+      trend: [...trend.values()].sort((a, b) => a.bucket.localeCompare(b.bucket)),
+      byChannel: [...byChannel.values()].sort((a, b) => b.orders - a.orders),
+      exceptions, review, lastRun: last?.at ?? null, autoMatchRate: last?.autoMatchRate ?? null,
+    });
+  });
+
+  // ---------- Audit log: read-only view of what people did ----------
+  r.get('/audit', auth(FINANCE), async (req, res) => {
+    const q = {};
+    const action = str(req.query.action); const by = str(req.query.by);
+    if (action) q.action = { $regex: `^${action.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}` };
+    if (by) q.by = by;
+    const page = Math.max(1, Number(req.query.page) || 1); const size = Math.min(100, Math.max(5, Number(req.query.size) || 50));
+    const [rows, total, users] = await Promise.all([
+      db.collection('audit').find(q).sort({ at: -1 }).skip((page - 1) * size).limit(size).toArray(),
+      db.collection('audit').countDocuments(q),
+      db.collection('audit').distinct('by'),
+    ]);
+    res.json({ rows, total, page, size, users: users.filter(Boolean) });
+  });
+
+  // ---------- Badge counts for navigation and notifications ----------
+  r.get('/counts', auth(), async (req, res) => {
+    const finance = FINANCE.includes(req.user.role);
+    const claimQ = req.user.role === 'returns' ? { type: 'return_not_received', status: 'open' } : { status: 'open' };
+    const [review, toFile, failed, missingReturns, noRate] = await Promise.all([
+      finance ? db.collection('lines').countDocuments({ state: 'review' }) : 0,
+      db.collection('claims').countDocuments(claimQ),
+      db.collection('uploads').countDocuments({ status: 'failed' }),
+      db.collection('orders').countDocuments({ delivery: 'returned', returnStatus: 'not_received' }),
+      finance ? db.collection('orders').countDocuments({ status: 'missing_rate_card' }) : 0,
+    ]);
+    const last = await db.collection('uploads').find({ status: 'imported' }).sort({ importedAt: -1 }).limit(1).next();
+    res.json({ review, toFile, failedUploads: failed, missingReturns, noRateCard: noRate, lastImport: last?.importedAt ?? null });
+  });
+
+  // ---------- Team: read-only list of who can sign in ----------
+  r.get('/users', auth(FINANCE), async (req, res) => {
+    res.json(await db.collection('users').find({}, { projection: { passwordHash: 0 } }).sort({ role: 1, name: 1 }).toArray());
   });
 
   return r;
